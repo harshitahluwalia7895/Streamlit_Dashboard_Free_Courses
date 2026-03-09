@@ -1,10 +1,21 @@
 import streamlit as st
+from supabase import create_client
 from datetime import date
-from supabase import create_client, Client
 
 st.set_page_config(page_title="Course Promo Tracker", page_icon="📣", layout="wide")
 
-# ── Courses ───────────────────────────────────────────────────────────────────
+# ── Supabase Client ────────────────────────────────────────────────────────────
+# Store these in Streamlit secrets (secrets.toml or Streamlit Cloud dashboard)
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+@st.cache_resource
+def get_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+supabase = get_supabase()
+
+# ── Data ───────────────────────────────────────────────────────────────────────
 COURSES = [
     {"id": 3252657,  "name": "RIP Data Scientists"},
     {"id": 2908028,  "name": "GenAI Applied to Quantitative Finance: For Control Implementation"},
@@ -34,57 +45,41 @@ PLATFORMS       = ["YouTube", "Instagram", "LinkedIn"]
 PLATFORM_ICONS  = {"YouTube": "▶", "Instagram": "◈", "LinkedIn": "in"}
 PLATFORM_COLORS = {"YouTube": "#E53E3E", "Instagram": "#D53F8C", "LinkedIn": "#2B6CB0"}
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_supabase() -> Client:
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-
-supabase = get_supabase()
-
-@st.cache_data(ttl=5)
+# ── DB Helpers ────────────────────────────────────────────────────────────────
 def load_promotions():
+    """Returns dict: { "course_id__Platform": {date, note, ...} }"""
     rows = supabase.table("promotions").select("*").execute().data
     result = {}
     for r in rows:
         key = f"{r['course_id']}__{r['platform']}"
-        result[key] = {"date": r["promo_date"], "note": r["note"] or ""}
+        result[key] = r
     return result
 
-@st.cache_data(ttl=5)
-def load_activity_log():
-    return (
-        supabase.table("promotions")
-        .select("*")
-        .order("created_at", desc=True)
-        .execute()
-        .data
-    )
-
-def db_add(course_id, course_name, platform, promo_date, note):
-    supabase.table("promotions").insert({
+def save_promotion_db(course_id, course_name, platform, promo_date, note):
+    supabase.table("promotions").upsert({
         "course_id":   str(course_id),
         "course_name": course_name,
         "platform":    platform,
         "promo_date":  str(promo_date),
-        "note":        note or "",
-    }).execute()
-    load_promotions.clear()
-    load_activity_log.clear()
+        "note":        note,
+    }, on_conflict="course_id,platform").execute()
 
-def db_remove(course_id, platform):
-    supabase.table("promotions").delete().match({
-        "course_id": str(course_id), "platform": platform
-    }).execute()
-    load_promotions.clear()
-    load_activity_log.clear()
+def delete_promotion_db(course_id, platform):
+    supabase.table("promotions")\
+        .delete()\
+        .eq("course_id", str(course_id))\
+        .eq("platform", platform)\
+        .execute()
 
-def get_promos(course_id, all_promos):
-    return {p: all_promos[f"{course_id}__{p}"] for p in PLATFORMS if f"{course_id}__{p}" in all_promos}
-
-# ── Session state ─────────────────────────────────────────────────────────────
-for k, v in [("show_form", False), ("form_course", None), ("form_platform", "YouTube")]:
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ── Session State Init ─────────────────────────────────────────────────────────
+for key, default in [
+    ("show_form",     False),
+    ("form_course",   None),
+    ("form_platform", "YouTube"),
+    ("last_toast",    None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 def open_form(course, platform):
     st.session_state.show_form     = True
@@ -96,67 +91,82 @@ def close_form():
     st.session_state.form_course   = None
     st.session_state.form_platform = "YouTube"
 
+# ── Load live data from Supabase ──────────────────────────────────────────────
+all_promos = load_promotions()
+
+def get_promos(course_id):
+    """Returns dict of { Platform: row } for a given course."""
+    result = {}
+    for plat in PLATFORMS:
+        key = f"{course_id}__{plat}"
+        if key in all_promos:
+            result[plat] = all_promos[key]
+    return result
+
+def compute_stats():
+    total   = len(COURSES)
+    done    = sum(1 for c in COURSES if len(get_promos(c["id"])) >= 1)
+    pending = sum(1 for c in COURSES if len(get_promos(c["id"])) == 0)
+    yt  = sum(1 for c in COURSES if "YouTube"   in get_promos(c["id"]))
+    ig  = sum(1 for c in COURSES if "Instagram" in get_promos(c["id"]))
+    li  = sum(1 for c in COURSES if "LinkedIn"  in get_promos(c["id"]))
+    return total, done, pending, yt, ig, li
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 .stApp { background: #F7F8FC; }
 #MainMenu, footer, header { visibility: hidden; }
 [data-testid="metric-container"] {
-    background:#fff; border:1px solid #e8ecf4; border-radius:14px;
-    padding:14px 18px !important; box-shadow:0 1px 4px rgba(0,0,0,0.05);
+    background: #fff; border: 1px solid #e8ecf4;
+    border-radius: 14px; padding: 14px 18px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
 }
 [data-testid="metric-container"] label {
-    font-size:11px !important; font-weight:700 !important;
-    text-transform:uppercase; letter-spacing:0.5px; color:#a0aec0 !important;
+    font-size: 11px !important; font-weight: 700 !important;
+    text-transform: uppercase; letter-spacing: 0.5px; color: #a0aec0 !important;
 }
 [data-testid="metric-container"] [data-testid="stMetricValue"] {
-    font-size:28px !important; font-weight:800 !important;
+    font-size: 28px !important; font-weight: 800 !important;
 }
 .stButton > button {
-    border-radius:8px !important; font-weight:600 !important;
-    font-size:12px !important; padding:4px 14px !important;
-    border:1px solid #e8ecf4 !important; transition:all 0.15s !important;
+    border-radius: 8px !important; font-weight: 600 !important;
+    font-size: 12px !important; padding: 4px 14px !important;
+    border: 1px solid #e8ecf4 !important; transition: all 0.15s !important;
 }
-.stButton > button:hover { transform:translateY(-1px); box-shadow:0 4px 12px rgba(0,0,0,0.1) !important; }
+.stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important; }
 .stTabs [data-baseweb="tab-list"] {
-    background:#fff; border-radius:10px; padding:4px; border:1px solid #e8ecf4; gap:4px;
+    background: #fff; border-radius: 10px;
+    padding: 4px; border: 1px solid #e8ecf4; gap: 4px;
 }
-.stTabs [data-baseweb="tab"] { border-radius:7px !important; font-weight:600 !important; font-size:13px !important; color:#a0aec0 !important; }
-.stTabs [aria-selected="true"] { background:#667eea !important; color:#fff !important; }
-.stTextInput input { border-radius:9px !important; border:1px solid #e8ecf4 !important; background:#fff !important; }
-.stSelectbox > div > div { border-radius:9px !important; border:1px solid #e8ecf4 !important; background:#fff !important; }
-.stProgress > div > div > div { background:linear-gradient(90deg,#667eea,#764ba2) !important; border-radius:3px !important; }
+.stTabs [data-baseweb="tab"] { border-radius: 7px !important; font-weight: 600 !important; font-size: 13px !important; color: #a0aec0 !important; }
+.stTabs [aria-selected="true"] { background: #667eea !important; color: #fff !important; }
+.stTextInput input { border-radius: 9px !important; border: 1px solid #e8ecf4 !important; background: #fff !important; }
+.stSelectbox > div > div { border-radius: 9px !important; border: 1px solid #e8ecf4 !important; background: #fff !important; }
+.stProgress > div > div > div { background: linear-gradient(90deg, #667eea, #764ba2) !important; border-radius: 3px !important; }
 .badge-done    { background:#ECFDF5; color:#059669; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:700; border:1px solid #6EE7B7; display:inline-block; }
 .badge-pending { background:#FFF7ED; color:#D97706; padding:3px 12px; border-radius:20px; font-size:12px; font-weight:700; border:1px solid #FCD34D; display:inline-block; }
 .promo-tag { padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; display:inline-block; }
 .form-card { background:#fff; border:2px solid #667eea; border-radius:16px; padding:20px 24px; margin:12px 0 20px; box-shadow:0 4px 20px rgba(102,126,234,0.15); }
-hr { border-color:#e8ecf4 !important; margin:6px 0 !important; }
+hr { border-color: #e8ecf4 !important; margin: 6px 0 !important; }
 </style>
 """, unsafe_allow_html=True)
-
-# ── Load data ─────────────────────────────────────────────────────────────────
-all_promos   = load_promotions()
-activity_log = load_activity_log()
-
-total   = len(COURSES)
-done    = sum(1 for c in COURSES if get_promos(c["id"], all_promos))
-pending = total - done
-yt  = sum(1 for c in COURSES if "YouTube"   in get_promos(c["id"], all_promos))
-ig  = sum(1 for c in COURSES if "Instagram" in get_promos(c["id"], all_promos))
-li  = sum(1 for c in COURSES if "LinkedIn"  in get_promos(c["id"], all_promos))
-pct = int((done / total) * 100) if total else 0
 
 # ── Header ────────────────────────────────────────────────────────────────────
 hc1, hc2 = st.columns([3, 2])
 with hc1:
     st.markdown("## 📣 Course Promo Tracker")
     st.caption("Analytics Vidhya · Free Courses")
+
+total, done, pending, yt, ig, li = compute_stats()
+pct = int((done / total) * 100) if total else 0
 with hc2:
     st.markdown(f"**Overall Progress** — {done}/{total} promoted &nbsp; `{pct}%`")
     st.progress(pct / 100)
 
 st.markdown("---")
 
+# ── Stats ─────────────────────────────────────────────────────────────────────
 s1, s2, s3, s4, s5, s6 = st.columns(6)
 s1.metric("📚 Total",     total)
 s2.metric("⏳ Pending",   pending)
@@ -167,57 +177,88 @@ s6.metric("in LinkedIn",  li)
 
 st.markdown("---")
 
+# ── Toast notification ────────────────────────────────────────────────────────
+if st.session_state.last_toast:
+    msg, kind = st.session_state.last_toast
+    if kind == "success":
+        st.success(msg)
+    elif kind == "warning":
+        st.warning(msg)
+    st.session_state.last_toast = None
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["📋  Courses", "🕒  Activity Log"])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1
+# TAB 1 — COURSES
 # ════════════════════════════════════════════════════════════════════════════════
 with tab1:
 
-    # Log form
+    # ── Log Form ──────────────────────────────────────────────────────────────
     if st.session_state.show_form and st.session_state.form_course:
         fc = st.session_state.form_course
         fp = st.session_state.form_platform
+
         st.markdown(
-            f'<div class="form-card"><h4 style="margin:0 0 4px;color:#1a202c;">📝 Log Promotion</h4>'
-            f'<p style="margin:0;color:#718096;font-size:13px;">{fc["name"]}</p></div>',
-            unsafe_allow_html=True)
+            f'<div class="form-card">'
+            f'<h4 style="margin:0 0 4px;color:#1a202c;">📝 Log Promotion</h4>'
+            f'<p style="margin:0;color:#718096;font-size:13px;">{fc["name"]}</p>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
         fa, fb, fc_col = st.columns([2, 2, 3])
         with fa:
-            sel_platform = st.selectbox("Platform", PLATFORMS, index=PLATFORMS.index(fp), key="form_sel_platform")
+            sel_platform = st.selectbox("Platform", PLATFORMS,
+                                        index=PLATFORMS.index(fp),
+                                        key="form_sel_platform")
         with fb:
             sel_date = st.date_input("Date", value=date.today(), key="form_sel_date")
         with fc_col:
-            sel_note = st.text_input("Note (optional)", placeholder="Post link, campaign name...", key="form_sel_note")
+            sel_note = st.text_input("Note (optional)",
+                                     placeholder="Post link, campaign name...",
+                                     key="form_sel_note")
 
-        sc, cc, _ = st.columns([1.8, 1.2, 4])
-        with sc:
-            if st.button("✓ Mark as Promoted", type="primary", use_container_width=True, key="form_save_btn"):
-                if sel_platform in get_promos(fc["id"], all_promos):
+        save_col, cancel_col, _ = st.columns([1.8, 1.2, 4])
+        with save_col:
+            if st.button("✓ Mark as Promoted", type="primary",
+                         use_container_width=True, key="form_save_btn"):
+                existing = get_promos(st.session_state.form_course["id"])
+                if sel_platform in existing:
                     st.warning(f"Already promoted on {sel_platform}!")
                 else:
-                    db_add(fc["id"], fc["name"], sel_platform, sel_date, sel_note)
+                    save_promotion_db(
+                        st.session_state.form_course["id"],
+                        st.session_state.form_course["name"],
+                        sel_platform, sel_date, sel_note
+                    )
+                    st.session_state.last_toast = (f"✓ Marked on {sel_platform}!", "success")
                     close_form()
                     st.rerun()
-        with cc:
+        with cancel_col:
             if st.button("✕ Cancel", use_container_width=True, key="form_cancel_btn"):
                 close_form()
                 st.rerun()
+
         st.markdown("---")
 
-    # Filters
+    # ── Filters ───────────────────────────────────────────────────────────────
     fl1, fl2 = st.columns([2, 3])
     with fl1:
-        search = st.text_input("", placeholder="🔍  Search courses...", label_visibility="collapsed", key="search_box")
+        search = st.text_input("", placeholder="🔍  Search courses...",
+                               label_visibility="collapsed", key="search_box")
     with fl2:
-        filter_opt = st.selectbox("", ["All", "✅ Done (promoted on any platform)",
+        filter_opt = st.selectbox(
+            "",
+            ["All", "✅ Done (promoted on any platform)",
              "⏳ Not yet promoted", "▶ YouTube", "◈ Instagram", "in LinkedIn"],
-            label_visibility="collapsed", key="filter_box")
+            label_visibility="collapsed", key="filter_box"
+        )
 
     def passes_filter(c):
-        p = get_promos(c["id"], all_promos)
-        if search and search.lower() not in c["name"].lower(): return False
+        p = get_promos(c["id"])
+        if search and search.lower() not in c["name"].lower():
+            return False
         if "All"       in filter_opt: return True
         if "Done"      in filter_opt: return len(p) >= 1
         if "Not yet"   in filter_opt: return len(p) == 0
@@ -230,13 +271,16 @@ with tab1:
     st.caption(f"{len(visible)} courses shown")
     st.markdown("")
 
+    # ── Column headers ─────────────────────────────────────────────────────────
     hdr = st.columns([4, 1.6, 1.6, 1.6, 1.4])
-    for col, lbl in zip(hdr, ["**Course**","**▶ YouTube**","**◈ Instagram**","**in LinkedIn**","**Status**"]):
+    for col, lbl in zip(hdr, ["**Course**", "**▶ YouTube**",
+                               "**◈ Instagram**", "**in LinkedIn**", "**Status**"]):
         col.markdown(lbl)
     st.markdown("<hr/>", unsafe_allow_html=True)
 
+    # ── Course Rows ────────────────────────────────────────────────────────────
     for course in visible:
-        promos  = get_promos(course["id"], all_promos)
+        promos  = get_promos(course["id"])
         is_done = len(promos) >= 1
         row     = st.columns([4, 1.6, 1.6, 1.6, 1.4])
 
@@ -247,30 +291,43 @@ with tab1:
         for idx, plat in enumerate(PLATFORMS):
             with row[idx + 1]:
                 if plat in promos:
+                    info  = promos[plat]
                     color = PLATFORM_COLORS[plat]
                     st.markdown(
-                        f"<span class='promo-tag' style='background:{color}18;color:{color};border:1px solid {color}44;'>"
-                        f"✓ {promos[plat]['date']}</span>", unsafe_allow_html=True)
+                        f"<span class='promo-tag' "
+                        f"style='background:{color}18;color:{color};border:1px solid {color}44;'>"
+                        f"✓ {info['promo_date']}</span>",
+                        unsafe_allow_html=True
+                    )
                     if st.button("✕ undo", key=f"undo__{course['id']}__{plat}"):
-                        db_remove(course["id"], plat)
+                        delete_promotion_db(course["id"], plat)
+                        st.session_state.last_toast = ("Entry removed.", "warning")
                         st.rerun()
                 else:
-                    if st.button("+ Log", key=f"log__{course['id']}__{plat}", use_container_width=True):
+                    if st.button("+ Log", key=f"log__{course['id']}__{plat}",
+                                 use_container_width=True):
                         open_form(course, plat)
                         st.rerun()
 
         with row[4]:
-            st.markdown(
-                '<span class="badge-done">✅ Done</span>' if is_done
-                else '<span class="badge-pending">⏳ Pending</span>',
-                unsafe_allow_html=True)
+            if is_done:
+                st.markdown('<span class="badge-done">✅ Done</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="badge-pending">⏳ Pending</span>', unsafe_allow_html=True)
+
         st.markdown("<hr/>", unsafe_allow_html=True)
 
+
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 2
+# TAB 2 — ACTIVITY LOG  (reads directly from Supabase, ordered by insert time)
 # ════════════════════════════════════════════════════════════════════════════════
 with tab2:
-    if not activity_log:
+    log_rows = supabase.table("promotions")\
+        .select("*")\
+        .order("created_at", desc=True)\
+        .execute().data
+
+    if not log_rows:
         st.markdown("""
         <div style='text-align:center;padding:60px 0;color:#a0aec0;'>
             <div style='font-size:44px'>📭</div>
@@ -279,16 +336,21 @@ with tab2:
         </div>""", unsafe_allow_html=True)
     else:
         lh = st.columns([3, 1.3, 1.3, 2])
-        for col, lbl in zip(lh, ["**Course**","**Platform**","**Date**","**Note**"]):
+        for col, lbl in zip(lh, ["**Course**", "**Platform**", "**Date**", "**Note**"]):
             col.markdown(lbl)
         st.markdown("<hr/>", unsafe_allow_html=True)
-        for entry in activity_log:
+
+        for entry in log_rows:
             plat  = entry["platform"]
             color = PLATFORM_COLORS.get(plat, "#718096")
             icon  = PLATFORM_ICONS.get(plat, "")
             lr    = st.columns([3, 1.3, 1.3, 2])
             lr[0].markdown(f"**{entry['course_name']}**")
-            lr[1].markdown(f"<span style='color:{color};font-weight:700;font-size:13px;'>{icon} {plat}</span>", unsafe_allow_html=True)
+            lr[1].markdown(
+                f"<span style='color:{color};font-weight:700;font-size:13px;'>"
+                f"{icon} {plat}</span>",
+                unsafe_allow_html=True
+            )
             lr[2].markdown(entry["promo_date"])
             lr[3].markdown(entry["note"] if entry["note"] else "—")
             st.markdown("<hr/>", unsafe_allow_html=True)
